@@ -4,19 +4,15 @@
 import requests
 import json
 import sys
+import time
 
+from requests import ConnectionError
 from datetime import date
 from collections import OrderedDict
 from bs4 import BeautifulSoup
 from string import ascii_uppercase
 
-#####################################CONSTANTS#################################
-# States for our scraping
-KEY = 0
-VALUE = 1
-
-
-######################################FUNCTIONS################################
+#################################FUNCTIONS#####################################
 # Checks whether a value represnts an integer
 def represents_int(s):
     try: 
@@ -58,6 +54,8 @@ def check_date(key, text):
 		if '/' in text:
 			day, month, year = [int(s) for s in text.split('/')]
 		else:
+			if len(text) != 6:
+				 text = raw_input(text + '\n')
 			day, month, year = [int(text[0:2]), int(text[2:4]), int(text[4:6])]
 		if year < 50: # Most years are represented by just two digits. 50 is arbitrary
 			year += 2000
@@ -87,32 +85,73 @@ def make_prefix_list(last_registration):
 # TODO: Should be able to try once more every minute
 # TODO: After 3 failed tries, save registration of the last attempt
 def make_request(url, data, save_file):
-	try:
-		# ANAC site does not have an updated certificate
-		html = requests.post(url, data=data, verify=False).text
-	except ConnetionError, e:
-		print "Connection with ANAC site was terminated. Verify internet connection"
-		save_last_search.write(data['txmtc'])
-		save_last_search.close()
-		sys.exit(0)
+	while True:
+		try:
+			# ANAC site does not have an updated certificate
+			html = requests.post(url, data=data, verify=False).text
+			break
+		except ConnectionError, e:
+			print "Connection with ANAC site was terminated. Verify internet connection"
+			with open("search_save.txt", "w") as save_file:
+				save_file.write(data['txmtc'])
+			time.sleep(30)
 	return html
 
 # Scraps ANAC site for a given registration
 # TODO: fill this function
-def scrap_for(registration):
-	pass
+def scrap_for(registration, html):
+	# Make a soup out of this page
+	html_soup = BeautifulSoup(html, 'html.parser')
+
+	# Initialize control variables
+	is_value_expected = True
+	is_header = True
+	is_first_cpf = True
+	plane = OrderedDict({'matricula': registration})
+
+	# Relevant info is marked with 'tx_bd' class
+	for element in html_soup.find_all('td', class_='tx_bd'):
+		text = element.get_text().strip(' \n\t\r')
+
+		if text == u'Proprietário:':
+			# Now the relevant information begins
+			is_header = False
+			is_value_expected = False
+
+		if not is_header and text != '':
+			if ':' in text:
+				# String indicates a key
+				if is_value_expected:
+					# Last value was null, update plane
+					key, is_first_cpf = check_cpf(key, is_first_cpf)
+					plane.update({key: None})
+					# Get new key
+					key = format_nicely(text)
+				else:
+					key = format_nicely(text)
+
+				is_value_expected = True
+			else:
+				if is_value_expected:
+					key, is_first_cpf = check_cpf(key, is_first_cpf)
+					#value = check_date(key, text)
+					plane.update({key: text})
+					is_value_expected = False
+	return plane
 
 #######################################MAIN####################################
 def main():
-	result_file = open(str(date.today()) + ".json", "w+")
-	save_file = open("search_save.txt", "r")
-	last_registration = save_file.readline()
-	save_file.close()
-	save_file = open("search_save.txt", "w")
+	# Initialize program
+	with open("search_save.txt", "r") as save_file:
+		last_registration = save_file.readline()
+		if last_registration == '':
+			last_registration = 'PPAAA'
+	result_file = open(str(date.today()) + ".json", "a")
+	
 	url = "https://sistemas.anac.gov.br/aeronaves/cons_rab.asp"
 	registrations = make_prefix_list(last_registration)
 
-	# Request every registration possible
+	# Request every registration possible, beggining with the last saved
 	for i, registration  in enumerate(registrations):
 		html = make_request(
 			url,
@@ -122,42 +161,13 @@ def main():
 			save_file
 		)
 		
-		# If registration exists, parse HTML and look for info
+		# If registration exists, scrap page
 		if 'MATR' in html:
 			print registration
-			html_soup = BeautifulSoup(html, 'html.parser')
-			state = VALUE
-			is_header = True
-			first_cpf = True
-			plane = OrderedDict({'matricula': registration})
-
-			# Relevant info is marked with 'tx_bd' class
-			for element in html_soup.find_all('td', class_='tx_bd'):
-				text = element.get_text().strip(' \n\t\r')
-
-				if text == u'Proprietário:':
-					is_header = False
-					state = KEY
-
-				if text != '' and not is_header:
-					if ':' in text:
-						if state == KEY:
-							key = format_nicely(text)
-						else: # Value was null
-							key, first_cpf = check_cpf(key, first_cpf)
-							plane.update({key: None})
-							key = format_nicely(text)
-						state = VALUE
-					else:
-						if state == VALUE:
-							key, first_cpf = check_cpf(key, first_cpf)
-							value = check_date(key, text)
-							plane.update({key: value})
-							state = KEY
-
+			plane = scrap_for(registration, html)
 			result_file.write(json.dumps(plane).encode('utf-8') + '\n')
 	
-	save_file.close()
+	#save_file.close()
 	result_file.close()
 
 if __name__ == '__main__':
